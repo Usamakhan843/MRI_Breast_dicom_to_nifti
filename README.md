@@ -97,7 +97,7 @@ For this dataset, the conversion produces:
 ## Installation
 
 ```bash
-git clone https://github.com/<your-username>/MRI_breast_dicom_to_nifti.git
+git clone https://github.com/Usamakhan843/MRI_breast_dicom_to_nifti.git
 cd MRI_breast_dicom_to_nifti
 pip install -r requirements.txt
 ```
