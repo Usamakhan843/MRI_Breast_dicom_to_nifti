@@ -231,6 +231,7 @@ This pipeline is a foundation. Logical next steps include:
 ## Author
 
 **Usama Khan**, PhD in Industrial and Information Engineering
+
 Research focus: medical image analysis, breast ultrasound radiomics, deep learning pipelines, PyTorch
 
 ---
