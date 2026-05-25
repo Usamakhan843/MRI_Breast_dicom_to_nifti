@@ -1,12 +1,17 @@
 """
 DICOM to NIfTI Conversion Pipeline — QIN-BREAST-02 (DCE Breast MRI)
 =====================================================================
-Converts DICOM series into correctly structured NIfTI volumes:
-  - Non-DCE series   : 3D volume  (192, 192, N_slices)
-  - DCE series       : 4D volume  (192, 192, N_slices, N_timepoints)
+A hybrid pipeline that uses dcm2niix as the conversion engine and
+adds batch orchestration, per-patient organization, QC validation,
+and summary reporting on top.
 
-This study grouped by TemporalPositionIdentifier (192, 192, 10, 10) first, sorts each
-group by ImagePositionPatient Z, then stacks into proper 4D.
+Why dcm2niix:
+    A hand-written converter must correctly separate every acquisition
+    sub-dimension — DCE temporal positions, DWI b-values, multi-echo
+    field maps, multi-flip series, qMT offsets. dcm2niix is the
+    industry-standard tool built specifically to handle all of these
+    plus coordinate-system (LPS/RAS) conversion. This pipeline delegates
+    the conversion to dcm2niix and focuses on orchestration and QC.
 
 Folder structure expected:
     data_dir/
@@ -18,23 +23,31 @@ Folder structure expected:
 Output structure:
     output_dir/
     └── PatientID/
-        └── SeriesNumber_SeriesDescription.nii.gz
+        ├── <series>.nii.gz      (image volume)
+        ├── <series>.json        (metadata sidecar from dcm2niix)
+        └── ...
 
 Usage:
-    python dicom_to_nifti.py                   # uses default paths
-    python dicom_to_nifti.py --pixel-stats     # also log volume statistics
-    python dicom_to_nifti.py -d /path -o /path # override paths
+    python dicom_to_nifti.py                    # uses default paths
+    python dicom_to_nifti.py -d /path -o /path  # override paths
 
-Author: Usama Khan
+Requirements:
+    dcm2niix   (pip install dcm2niix)
+    SimpleITK  (for QC dimension checks)
+    pydicom    (to read PatientID for output organization)
+
+Author: Usama
 """
 
 import argparse
+import json
 import logging
-import re
+import shutil
+import subprocess
 from collections import defaultdict
+from datetime import datetime
 from pathlib import Path
 
-import numpy as np
 import pydicom
 import SimpleITK as sitk
 
@@ -56,251 +69,261 @@ logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
-# Helpers
+# Step 0 — Verify dcm2niix is available
 # ---------------------------------------------------------------------------
 
-def slugify(text: str) -> str:
-    """Convert a string to a safe filename."""
-    text = text.strip().replace(" ", "_")
-    text = re.sub(r"[^\w\-]", "", text)
-    return text[:60]
-
-
-def get_spacing_origin_direction(ds: pydicom.Dataset):
+def check_dcm2niix() -> list:
     """
-    Extract spatial geometry from a DICOM slice.
-    Returns voxel spacing (x, y), image origin, and direction cosines.
+    Confirm dcm2niix is available and return the command list to invoke it.
+
+    Resolution order:
+      1. The pip 'dcm2niix' package, which bundles the binary and exposes
+         its path via dcm2niix.bin_path
+      2. A dcm2niix binary already on the system PATH
+
+    Note: 'dcm2niix --version' exits with a non-zero status code by
+    design, so check=True must NOT be used for the probe. We only
+    confirm the binary is executable and produces version output.
+
+    Returns the invoker as a list, e.g. ['/path/to/dcm2niix'].
+    Raises RuntimeError if neither is found.
     """
-    pixel_spacing = [float(v) for v in ds.PixelSpacing]       # [row, col] spacing in mm
-    origin        = [float(v) for v in ds.ImagePositionPatient]
-    direction     = [float(v) for v in ds.ImageOrientationPatient]
-    return pixel_spacing, origin, direction
+    candidates = []
 
+    # Option 1: pip package that bundles the binary
+    try:
+        import dcm2niix
+        candidates.append(str(dcm2niix.bin_path))
+    except Exception:
+        pass
 
-def log_volume_stats(arr: np.ndarray, label: str) -> None:
-    """Log basic intensity statistics for a volume."""
-    logger.info(
-        f"  {label} | shape: {arr.shape} | "
-        f"mean: {arr.mean():.2f} | std: {arr.std():.2f} | "
-        f"min: {arr.min():.2f} | max: {arr.max():.2f}"
+    # Option 2: dcm2niix already on PATH (e.g. apt install)
+    on_path = shutil.which("dcm2niix")
+    if on_path:
+        candidates.append(on_path)
+
+    for binary in candidates:
+        try:
+            result = subprocess.run(
+                [binary, "--version"], capture_output=True, text=True
+            )
+            # dcm2niix prints its version then exits non-zero; we only
+            # need the binary to run and emit recognizable output.
+            if "dcm2nii" in (result.stdout + result.stderr).lower():
+                logger.info(f"dcm2niix found: {binary}")
+                return [binary]
+        except (OSError, FileNotFoundError):
+            continue
+
+    raise RuntimeError(
+        "dcm2niix not found. Install it with:  pip install dcm2niix"
     )
 
 
 # ---------------------------------------------------------------------------
-# Core: read and group DICOM slices in one series folder
+# Step 1 — Identify the PatientID for a series folder
 # ---------------------------------------------------------------------------
 
-def read_series_folder(series_dir: Path) -> tuple[list, dict]:
+def get_patient_id(series_dir: Path) -> str:
     """
-    Read all DICOM files in a series folder.
-    Returns:
-        datasets : list of pydicom Datasets (with pixel data)
-        info     : dict with patient_id, series_num, series_desc
+    Read one DICOM file in the series folder to extract PatientID.
+    Used to organize outputs into per-patient folders.
+    Returns 'UNKNOWN' if no readable file is found.
     """
-    dcm_files = list(series_dir.glob("*.dcm"))
-    if not dcm_files:
-        return [], {}
-
-    datasets = []
-    for f in dcm_files:
+    for dcm_file in series_dir.glob("*.dcm"):
         try:
-            ds = pydicom.dcmread(str(f))
-            datasets.append(ds)
-        except Exception as e:
-            logger.warning(f"  Could not read {f.name}: {e}")
-
-    if not datasets:
-        return [], {}
-
-    # Extract naming info from first file
-    ds0  = datasets[0]
-    info = {
-        "patient_id":  getattr(ds0, "PatientID",        "UNKNOWN"),
-        "series_num":  getattr(ds0, "SeriesNumber",      "000"),
-        "series_desc": getattr(ds0, "SeriesDescription", "unknown"),
-    }
-    return datasets, info
-
-
-def group_by_temporal_position(datasets: list) -> dict:
-    """
-    Group DICOM slices by TemporalPositionIdentifier.
-    If tag is absent (non-DCE series), all slices go into group '1'.
-    Within each group, sort slices by ImagePositionPatient Z coordinate.
-    Returns: {temporal_position: [sorted datasets]}
-    """
-    groups = defaultdict(list)
-    for ds in datasets:
-        tp = str(getattr(ds, "TemporalPositionIdentifier", "1"))
-        groups[tp].append(ds)
-
-    # Sort each group by Z position (physical slice location)
-    for tp in groups:
-        groups[tp].sort(
-            key=lambda ds: float(ds.ImagePositionPatient[2])
-        )
-
-    return dict(sorted(groups.items(), key=lambda x: int(x[0])))
-
-
-def build_sitk_volume(sorted_slices: list) -> sitk.Image:
-    """
-    Stack a sorted list of DICOM slices into a 3D SimpleITK image.
-    Applies RescaleSlope and RescaleIntercept per slice.
-    Sets correct voxel spacing, origin, and direction.
-    """
-    pixel_arrays = []
-    for ds in sorted_slices:
-        pixels    = ds.pixel_array.astype(np.float32)
-        slope     = float(getattr(ds, "RescaleSlope",     1))
-        intercept = float(getattr(ds, "RescaleIntercept", 0))
-        pixel_arrays.append(pixels * slope + intercept)
-
-    # Stack slices along Z axis: shape (N_slices, rows, cols)
-    volume = np.stack(pixel_arrays, axis=0)
-
-    # Convert to SimpleITK image
-    # Note: SimpleITK uses (x, y, z) but numpy uses (z, y, x) — flip needed
-    image = sitk.GetImageFromArray(volume)
-
-    # Set spatial geometry from first slice
-    ds0           = sorted_slices[0]
-    ds1           = sorted_slices[1] if len(sorted_slices) > 1 else sorted_slices[0]
-    pixel_spacing = [float(v) for v in ds0.PixelSpacing]
-
-    # Compute slice thickness from actual Z positions (more reliable than tag)
-    z0             = float(ds0.ImagePositionPatient[2])
-    z1             = float(ds1.ImagePositionPatient[2])
-    slice_spacing  = abs(z1 - z0) if z0 != z1 else float(getattr(ds0, "SliceThickness", 5.0))
-
-    image.SetSpacing([pixel_spacing[1], pixel_spacing[0], slice_spacing])
-    image.SetOrigin([float(v) for v in ds0.ImagePositionPatient])
-
-    # Set direction cosines from ImageOrientationPatient
-    iop    = [float(v) for v in ds0.ImageOrientationPatient]
-    row    = iop[:3]   # direction of rows
-    col    = iop[3:]   # direction of columns
-    normal = list(np.cross(row, col))   # normal to the slice plane
-    image.SetDirection(row + col + normal)
-
-    return image
+            ds = pydicom.dcmread(str(dcm_file), stop_before_pixels=True)
+            return str(getattr(ds, "PatientID", "UNKNOWN"))
+        except Exception:
+            continue
+    return "UNKNOWN"
 
 
 # ---------------------------------------------------------------------------
-# Core: convert one series folder to NIfTI
+# Step 2 — Convert one series folder with dcm2niix
 # ---------------------------------------------------------------------------
 
-def convert_series(series_dir: Path, output_dir: Path,
-                   pixel_stats: bool = False) -> bool:
+def convert_series(invoker: list, series_dir: Path, patient_out: Path) -> list[Path]:
     """
-    Convert one DICOM series folder to a 3D or 4D NIfTI volume.
-    DCE series with multiple temporal positions produce 4D output.
+    Run dcm2niix on one series folder.
+
+    dcm2niix automatically:
+      - separates DWI b-values, multi-echo, multi-flip, DCE dynamics
+      - corrects LPS to RAS coordinate orientation
+      - writes a .json metadata sidecar next to each .nii.gz
+
+    Filename format flags:
+      %s = series number     %d = series description
+      %e = echo number       (appended automatically when relevant)
+
+    Returns a list of generated .nii.gz file paths.
     """
-    datasets, info = read_series_folder(series_dir)
-    if not datasets:
-        logger.warning(f"  Skipping empty series: {series_dir.name}")
-        return False
-
-    patient_id  = info["patient_id"]
-    series_num  = info["series_num"]
-    series_desc = slugify(info["series_desc"])
-
-    patient_out = output_dir / patient_id
     patient_out.mkdir(parents=True, exist_ok=True)
 
-    out_filename = f"{series_num}_{series_desc}.nii.gz"
-    out_path     = patient_out / out_filename
+    cmd = invoker + [
+        "-o", str(patient_out),     # output directory
+        "-f", "%s_%d",              # filename: seriesNumber_seriesDescription
+        "-z", "y",                  # compress output to .nii.gz
+        "-b", "y",                  # write .json BIDS sidecar
+        str(series_dir),            # input series folder
+    ]
 
-    if out_path.exists():
-        logger.info(f"  Already exists, skipping: {out_path.name}")
-        return True
+    # Snapshot existing files so we only return newly created ones
+    before = set(patient_out.glob("*.nii.gz"))
 
     try:
-        # Group slices by temporal position
-        groups = group_by_temporal_position(datasets)
-        n_timepoints = len(groups)
-        n_slices     = len(list(groups.values())[0])
+        # dcm2niix may return a non-zero exit code even on a successful
+        # conversion, so success is judged by whether new .nii.gz files
+        # were actually produced, not by the return code.
+        subprocess.run(cmd, capture_output=True, text=True)
+        after    = set(patient_out.glob("*.nii.gz"))
+        produced = list(after - before)
+        return produced
+    except (OSError, FileNotFoundError) as e:
+        logger.error(f"  dcm2niix could not run for {series_dir.name}: {e}")
+        return []
 
-        logger.info(
-            f"  {series_desc} | "
-            f"{n_timepoints} timepoint(s) x {n_slices} slices"
-        )
 
-        # Build one 3D volume per temporal position
-        volumes = []
-        for tp, slices in groups.items():
-            vol = build_sitk_volume(slices)
-            volumes.append(vol)
+# ---------------------------------------------------------------------------
+# Step 3 — QC check on a converted NIfTI file
+# ---------------------------------------------------------------------------
 
-        if n_timepoints == 1:
-            # Non-DCE: save as 3D
-            final_image = volumes[0]
-            arr         = sitk.GetArrayFromImage(final_image)
-            logger.info(f"  3D volume shape: {arr.shape}")
-        else:
-            # DCE: force all volumes to share the same physical space as
-            # the first temporal position before joining into 4D.
-            # Patient motion between time points causes slightly different
-            # origins/directions which makes JoinSeries fail.
-            ref_spacing   = volumes[0].GetSpacing()
-            ref_origin    = volumes[0].GetOrigin()
-            ref_direction = volumes[0].GetDirection()
-            for vol in volumes:
-                vol.SetSpacing(ref_spacing)
-                vol.SetOrigin(ref_origin)
-                vol.SetDirection(ref_direction)
-            final_image = sitk.JoinSeries(volumes)
-            arr         = sitk.GetArrayFromImage(final_image)
-            logger.info(f"  4D volume shape: {arr.shape}  (slices x timepoints x rows x cols)")
-
-        if pixel_stats:
-            log_volume_stats(sitk.GetArrayFromImage(final_image), out_filename)
-
-        sitk.WriteImage(final_image, str(out_path))
-        logger.info(f"  Saved: {out_path.name}")
-        return True
-
+def qc_check(nifti_path: Path) -> dict:
+    """
+    Read a converted NIfTI file and return basic QC information:
+    dimensionality, size, voxel spacing.
+    """
+    try:
+        img = sitk.ReadImage(str(nifti_path))
+        return {
+            "file":      nifti_path.name,
+            "dimension": img.GetDimension(),
+            "size":      img.GetSize(),
+            "spacing":   tuple(round(s, 3) for s in img.GetSpacing()),
+            "ok":        True,
+        }
     except Exception as e:
-        logger.error(f"  Conversion failed for {series_dir.name}: {e}")
-        return False
+        return {"file": nifti_path.name, "ok": False, "error": str(e)}
 
 
 # ---------------------------------------------------------------------------
-# Batch: walk entire dataset
+# Step 4 — Batch process the whole dataset
 # ---------------------------------------------------------------------------
 
-def convert_dataset(data_dir: str, output_dir: str,
-                    pixel_stats: bool = False) -> None:
+def convert_dataset(data_dir: str, output_dir: str) -> list[dict]:
+    """
+    Walk the dataset, convert every series folder, and run QC.
+    Returns a list of QC records, one per generated NIfTI file.
+    """
+    invoker     = check_dcm2niix()
     data_path   = Path(data_dir)
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
 
+    # Collect all series-level folders (those directly containing .dcm files)
     series_dirs = [
         p for p in data_path.rglob("*")
         if p.is_dir() and any(p.glob("*.dcm"))
     ]
-
-    total   = len(series_dirs)
-    success = 0
-    failed  = 0
-
+    total = len(series_dirs)
     logger.info(f"Found {total} series folders to convert.")
 
+    qc_records   = []
+    converted    = 0
+    failed       = 0
+
     for i, series_dir in enumerate(series_dirs, 1):
-        logger.info(f"[{i}/{total}] {series_dir.name[:50]}")
-        ok = convert_series(series_dir, output_path, pixel_stats=pixel_stats)
-        if ok:
-            success += 1
-        else:
+        patient_id  = get_patient_id(series_dir)
+        patient_out = output_path / patient_id
+
+        logger.info(f"[{i}/{total}] {patient_id} | {series_dir.name[:40]}")
+
+        produced = convert_series(invoker, series_dir, patient_out)
+
+        if not produced:
             failed += 1
+            continue
+
+        # QC each produced file
+        for nifti_path in produced:
+            qc = qc_check(nifti_path)
+            qc["patient_id"] = patient_id
+            qc_records.append(qc)
+            if qc["ok"]:
+                logger.info(f"  {qc['file']} | dim {qc['dimension']} | size {qc['size']}")
+            else:
+                logger.warning(f"  QC FAILED: {qc['file']} | {qc.get('error')}")
+
+        converted += 1
 
     logger.info("")
-    logger.info("=" * 50)
+    logger.info("=" * 55)
     logger.info("Conversion complete.")
-    logger.info(f"  Successful : {success}")
-    logger.info(f"  Failed     : {failed}")
-    logger.info(f"  Output dir : {output_dir}")
-    logger.info("=" * 50)
+    logger.info(f"  Series converted : {converted}/{total}")
+    logger.info(f"  Series failed    : {failed}")
+    logger.info(f"  NIfTI files made : {len(qc_records)}")
+    logger.info("=" * 55)
+
+    return qc_records
+
+
+# ---------------------------------------------------------------------------
+# Step 5 — Summary report
+# ---------------------------------------------------------------------------
+
+def write_summary(qc_records: list[dict], data_dir: str,
+                  output_dir: str, report_path: str) -> None:
+    """Generate a plain-text QC summary report."""
+
+    per_patient = defaultdict(int)
+    dim_counts  = defaultdict(int)
+    qc_failures = []
+
+    for r in qc_records:
+        per_patient[r["patient_id"]] += 1
+        if r.get("ok"):
+            dim_counts[r["dimension"]] += 1
+        else:
+            qc_failures.append(r)
+
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    lines = [
+        "=" * 60,
+        "  QIN-BREAST-02 — DICOM TO NIfTI CONVERSION REPORT",
+        "=" * 60,
+        f"  Generated        : {now}",
+        f"  Source dir       : {data_dir}",
+        f"  Output dir       : {output_dir}",
+        f"  Conversion engine: dcm2niix",
+        f"  Total NIfTI files: {len(qc_records)}",
+        "",
+        "  FILES PER PATIENT",
+        "-" * 60,
+    ]
+    for pid, count in sorted(per_patient.items()):
+        lines.append(f"  {pid:<35} {count} volumes")
+
+    lines += [
+        "",
+        "  VOLUME DIMENSIONALITY",
+        "-" * 60,
+        f"  3D volumes       : {dim_counts.get(3, 0)}",
+        f"  4D volumes       : {dim_counts.get(4, 0)}",
+        "",
+        "  QC STATUS",
+        "-" * 60,
+        f"  Passed QC        : {len(qc_records) - len(qc_failures)}",
+        f"  Failed QC        : {len(qc_failures)}",
+    ]
+    for r in qc_failures:
+        lines.append(f"    - {r['file']}: {r.get('error', 'unknown error')}")
+
+    lines += ["", "=" * 60]
+
+    with open(report_path, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines))
+    logger.info(f"Summary report saved → {report_path}")
 
 
 # ---------------------------------------------------------------------------
@@ -309,21 +332,29 @@ def convert_dataset(data_dir: str, output_dir: str,
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Convert QIN-BREAST-02 DICOM series to NIfTI volumes."
+        description="Convert QIN-BREAST-02 DICOM series to NIfTI using dcm2niix."
     )
-    parser.add_argument("--data-dir",    "-d", default=DEFAULT_DATA_DIR)
-    parser.add_argument("--output-dir",  "-o", default=DEFAULT_OUTPUT_DIR)
-    parser.add_argument("--pixel-stats", "-p", action="store_true",
-                        help="Log intensity statistics per volume")
+    parser.add_argument("--data-dir",   "-d", default=DEFAULT_DATA_DIR,
+                        help=f"Root DICOM directory (default: {DEFAULT_DATA_DIR})")
+    parser.add_argument("--output-dir", "-o", default=DEFAULT_OUTPUT_DIR,
+                        help=f"NIfTI output directory (default: {DEFAULT_OUTPUT_DIR})")
     return parser.parse_args()
 
 
 def main():
     args = parse_args()
-    logger.info("DICOM to NIfTI Conversion Pipeline (4D-aware)")
+    logger.info("DICOM to NIfTI Conversion Pipeline (dcm2niix engine)")
     logger.info(f"Source : {args.data_dir}")
     logger.info(f"Output : {args.output_dir}")
-    convert_dataset(args.data_dir, args.output_dir, pixel_stats=args.pixel_stats)
+
+    qc_records  = convert_dataset(args.data_dir, args.output_dir)
+
+    report_path = str(Path(args.output_dir) / "conversion_report.txt")
+    write_summary(qc_records, args.data_dir, args.output_dir, report_path)
+
+    print("\n✓ Pipeline complete.")
+    print(f"  NIfTI files → {args.output_dir}")
+    print(f"  QC report   → {report_path}")
 
 
 if __name__ == "__main__":
