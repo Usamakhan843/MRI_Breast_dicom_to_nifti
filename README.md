@@ -1,25 +1,56 @@
-# DICOM to NIfTI Conversion for Breast MRI
+# DICOM to NIfTI Conversion Pipeline for Breast MRI
 
-A Python pipeline that converts raw DICOM medical image slices into organized 3D and 4D NIfTI volumes ready for research analysis. Built and tested on the QIN-BREAST-02 collection from The Cancer Imaging Archive (TCIA), a publicly available Dynamic Contrast-Enhanced (DCE) breast MRI dataset.
+A conversion and quality-control pipeline that transforms raw clinical DICOM image series into research-ready NIfTI volumes. The pipeline uses `dcm2niix` as its conversion engine and adds patient-level organization, automated QC validation, and summary reporting around it.
 
-This is the second project in a learning portfolio focused on medical imaging pipeline development. It builds on a previous metadata extraction pipeline by moving from inspection to transformation: converting clinical-format data into the research-format expected by tools like 3D Slicer, ITK-SNAP, LIFEx, MONAI, and PyRadiomics.
+Built and tested on the QIN-BREAST-02 collection from The Cancer Imaging Archive (TCIA), a publicly available Dynamic Contrast-Enhanced (DCE) breast MRI dataset of 13 subjects. It follows a DICOM metadata extraction pipeline and moves from inspecting data to transforming it into the format expected by research tools such as 3D Slicer, ITK-SNAP, LIFEx, MONAI, and PyRadiomics.
 
 ---
 
-## Why This Project Exists
+## Table of Contents
 
-Medical scanners output images in DICOM format. Each slice of a scan is saved as a separate `.dcm` file with rich clinical metadata attached. While this format is excellent for hospital systems and clinical workflows, it is impractical for research.
+- [Motivation](#motivation)
+- [Design Decision: Why dcm2niix](#design-decision-why-dcm2niix)
+- [Dataset](#dataset)
+- [Pipeline Overview](#pipeline-overview)
+- [Input and Output Structure](#input-and-output-structure)
+- [Installation](#installation)
+- [Usage](#usage)
+- [Implementation Notes](#implementation-notes)
+- [What This Project Demonstrates](#what-this-project-demonstrates)
+- [Possible Extensions](#possible-extensions)
 
-A single DCE breast MRI study can produce 2,000 to 3,000 individual DICOM files, scattered across nested folders by patient, study, and series. Before any meaningful analysis can begin, those slices must be:
+---
 
-1. Grouped together by acquisition sequence
-2. Sorted by physical position in space
-3. Stacked into proper 3D or 4D volumes
-4. Saved in a format the analysis tools understand
+## Motivation
 
-NIfTI is the standard format in medical imaging research. One NIfTI file represents one full 3D volume (or 4D in the case of dynamic studies), with spatial geometry preserved in a compact, self-contained file.
+Medical scanners store images in DICOM format, where every individual slice is a separate `.dcm` file carrying a full header of clinical metadata. This format suits hospital systems but is impractical for research. A single DCE breast MRI study can produce several thousand DICOM files spread across nested folders.
 
-This pipeline automates that conversion.
+Before analysis can begin, those slices must be grouped by acquisition sequence, ordered by physical position, separated by acquisition sub-dimension (time point, b-value, echo), and stacked into coherent 3D or 4D volumes. NIfTI is the research standard: one file holds one complete volume with spatial geometry preserved.
+
+This pipeline automates that transformation across an entire dataset.
+
+---
+
+## Design Decision: Why dcm2niix
+
+This project initially used a custom converter written with `pydicom` and `SimpleITK`. That version grouped slices only by `TemporalPositionIdentifier`. It worked for DCE and multi-flip series but failed silently on others.
+
+The failure surfaced during visual inspection in ITK-SNAP and LIFEx: diffusion-weighted (DWI) and field-map volumes showed a distinctive horizontal striping artifact. The cause was identified as multi-volume interleaving. A DWI series contains several b-values stored in one folder; the custom converter did not separate them, so slices from different b-values were stacked together in the wrong order.
+
+Correctly handling every acquisition sub-dimension (DCE time points, DWI b-values, multi-echo field maps, multi-flip series, qMT offsets) along with coordinate-system conversion is a substantial engineering problem. `dcm2niix` is the established open-source tool built specifically for this, refined over years of edge-case handling.
+
+The pipeline was therefore redesigned around a clear separation of responsibilities:
+
+| Responsibility | Handled by |
+|---|---|
+| DICOM to NIfTI conversion | `dcm2niix` |
+| Sub-dimension separation, orientation | `dcm2niix` |
+| Batch orchestration over the dataset | This pipeline |
+| Per-patient output organization | This pipeline |
+| QC validation of every output volume | This pipeline |
+| Summary reporting | This pipeline |
+
+Choosing an established tool over a custom reimplementation is a deliberate engineering decision, not a shortcut. The value of this project lies in robust orchestration and validation around a trusted conversion core.
 
 ---
 
@@ -38,28 +69,25 @@ This pipeline automates that conversion.
 | License | CC BY 4.0 |
 | Source | [TCIA Collection Page](https://www.cancerimagingarchive.net/collection/qin-breast-02/) |
 
-The dataset contains a mix of sequence types: DCE-MRI with multiple temporal positions per series, diffusion weighted imaging, T1 mapping, quantitative magnetization transfer, and field maps. Each requires either 3D or 4D representation depending on whether temporal information is present.
+The dataset mixes several sequence types: DCE-MRI, diffusion-weighted imaging, T1 mapping, quantitative magnetization transfer, and field maps. Each produces 3D or 4D volumes depending on its acquisition structure.
 
 ---
 
-## What This Pipeline Does
+## Pipeline Overview
 
-For every series folder in the dataset, the pipeline performs the following steps:
-
-1. Reads all DICOM files in the folder using `pydicom`
-2. Groups slices by `TemporalPositionIdentifier`, which is relevant for DCE series with multiple time points
-3. Sorts each group by physical Z position using `ImagePositionPatient`
-4. Stacks slices into 3D volumes with correct voxel spacing, origin, and direction cosines
-5. For multi-timepoint series, joins individual 3D volumes into a single 4D volume
-6. Saves the result as a compressed NIfTI file (`.nii.gz`)
-
-The output structure mirrors the patient hierarchy and uses meaningful filenames based on series number and sequence description.
+```
+Step 1   For each series folder, read PatientID for output organization
+Step 2   Run dcm2niix on the series folder (the conversion itself)
+Step 3   QC check every produced NIfTI file (dimensions, size, spacing)
+Step 4   Repeat across all 235 series folders
+Step 5   Write a QC summary report
+```
 
 ---
 
 ## Input and Output Structure
 
-**Input** (DICOM hierarchy from TCIA):
+**Input** (DICOM hierarchy as downloaded from TCIA):
 
 ```
 qin_breast_02/
@@ -71,26 +99,23 @@ qin_breast_02/
             └── ...
 ```
 
-**Output** (NIfTI volumes):
+**Output** (NIfTI volumes plus metadata sidecars):
 
 ```
 nifti_output/
 ├── QIN-BREAST-02-0001/
-│   ├── 8101_THRIVE_SENSE.nii.gz
-│   ├── 7401_DWI_EPI_b0200800.nii.gz
-│   ├── 8401_qMT_3D_Pulsed_Trig.nii.gz
+│   ├── 8101_THRIVE_SENSE.nii.gz      image volume
+│   ├── 8101_THRIVE_SENSE.json        metadata sidecar
+│   ├── 7401_DWI_EPI.nii.gz
+│   ├── 7401_DWI_EPI.json
 │   └── ...
 ├── QIN-BREAST-02-0002/
 │   └── ...
-...
-└── QIN-BREAST-02-0013/
+├── ...
+└── conversion_report.txt             QC summary
 ```
 
-For this dataset, the conversion produces:
-
-- 31,790 DICOM slices, reduced to
-- 170 NIfTI volumes (99 are 3D, 71 are 4D)
-- approximately 13 sequences per patient
+For each series, `dcm2niix` produces a compressed `.nii.gz` volume and a `.json` sidecar containing acquisition metadata in BIDS format. When a series contains multiple sub-volumes (for example several b-values), `dcm2niix` writes each as a separate correctly ordered file.
 
 ---
 
@@ -105,128 +130,79 @@ pip install -r requirements.txt
 Requirements:
 
 ```
-pydicom>=2.4.0
+dcm2niix>=1.0.20240000
 SimpleITK>=2.3.0
-numpy>=1.24.0
+pydicom>=2.4.0
 ```
+
+The pip `dcm2niix` package bundles the conversion binary, so no separate system installation is required.
 
 ---
 
 ## Usage
 
-The default data and output paths are hardcoded at the top of the script. Most users only need to run:
+Default data and output paths are set at the top of the script. Routine use requires only:
 
 ```bash
 python dicom_to_nifti.py
 ```
 
-To override paths or enable pixel statistics logging:
+To override the paths:
 
 ```bash
-# Override paths
 python dicom_to_nifti.py -d /path/to/dicoms -o /path/to/output
-
-# Log intensity statistics for each volume after conversion
-python dicom_to_nifti.py --pixel-stats
 ```
 
-The script skips files that have already been converted, so it is safe to re-run.
+The script reports progress per series and writes a QC summary on completion.
 
 ---
 
-## Key Implementation Details
+## Implementation Notes
 
-### Sorting by Physical Position, Not by Filename
+### Locating the dcm2niix binary
 
-DICOM filenames are arbitrary hashes. The only reliable way to order slices is by the `ImagePositionPatient` tag, which gives the physical (x, y, z) coordinate of the slice in scanner space. Within each temporal group, slices are sorted by their Z coordinate.
+The pip `dcm2niix` package does not place a command on the system PATH. Instead it bundles the binary inside the package directory and exposes its location through `dcm2niix.bin_path`. The pipeline imports the package and resolves the binary from there, with a fallback to any system-installed `dcm2niix` on the PATH.
 
-### Voxel Spacing from Actual Z Differences
+### Success is judged by output, not by exit code
 
-The `SliceThickness` DICOM tag is not always reliable, especially when slices have gaps between them. The pipeline computes slice spacing directly from the difference between consecutive Z positions of the sorted slices. This produces accurate voxel geometry in the output NIfTI.
+`dcm2niix` returns a non-zero exit status in situations that are not failures. Its `--version` call exits non-zero by design, and some successful conversions also return non-zero. Relying on the exit code therefore produces false failures.
 
-### Handling DCE Temporal Positions
+The pipeline judges success by inspecting the actual result instead:
 
-A DCE-MRI series interleaves slices from multiple time points within the same folder. The pipeline groups them by `TemporalPositionIdentifier` first, builds one 3D volume per time point, then joins these into a 4D volume.
+- For the availability check, it confirms the binary runs and emits recognizable version output.
+- For each conversion, it snapshots the output folder before and after the call and treats any newly created `.nii.gz` files as the success signal.
 
-### Solving the Physical Space Mismatch
+This is a general principle worth noting: an exit code is a claim, not a guarantee. Verifying the real artifact is more reliable.
 
-During DCE acquisition, patients breathe between scans. This causes each time point to be at a marginally different physical position, often submillimeter differences. SimpleITK's `JoinSeries` strictly requires identical physical space across all inputs, and rejects the join with a "physical space mismatch" error even for tiny discrepancies.
+### Quality control on every volume
 
-The pipeline resolves this by copying spatial metadata from the first time point to all subsequent time points before joining. The pixel data itself is not modified. If precise motion correction is required for downstream analysis, that is handled as a separate registration step.
-
-### Rescale Slope and Intercept
-
-DICOM pixel values are often stored as integers with a slope and intercept that must be applied to recover the true intensity values:
-
-```
-true_intensity = stored_value * RescaleSlope + RescaleIntercept
-```
-
-The pipeline applies this conversion automatically for every slice before stacking.
-
----
-
-## Example Output
-
-```
-14:23:11 | INFO | DICOM to NIfTI Conversion Pipeline (4D-aware)
-14:23:11 | INFO | Source : /home/usama/dicom_learning/data/qin_breast_02
-14:23:11 | INFO | Output : /home/usama/dicom_learning/nifti_output
-14:23:11 | INFO | Found 235 series folders to convert.
-14:23:12 | INFO | [1/235] 1.3.6.1.4.1.14519.5.2.1.8162.5966.347764622180583097
-14:23:12 | INFO |   multi-flip_T1-map | 10 timepoint(s) x 10 slices
-14:23:13 | INFO |   4D volume shape: (10, 10, 192, 192)
-14:23:13 | INFO |   Saved: 8501_multi-flip_T1-map.nii.gz
-...
-14:47:11 | INFO | Conversion complete.
-14:47:11 | INFO |   Successful : 235
-14:47:11 | INFO |   Failed     : 0
-```
-
----
-
-## Verifying Output
-
-A quick check that 4D volumes are correctly structured:
-
-```python
-import SimpleITK as sitk
-
-img = sitk.ReadImage("nifti_output/QIN-BREAST-02-0001/8501_multi-flip_T1-map.nii.gz")
-print("Size       :", img.GetSize())     # (192, 192, 10, 10)
-print("Spacing    :", img.GetSpacing())  # (1.33, 1.33, 5.0, 1.0)
-print("Dimensions :", img.GetDimension())
-```
-
-A 4D size of (192, 192, 10, 10) reads as: 192 by 192 in-plane resolution, 10 slices through the breast, 10 temporal positions across the DCE acquisition.
+After each conversion, every produced NIfTI file is opened with `SimpleITK` and checked for readability, dimensionality (3D or 4D), size, and voxel spacing. These results feed the final summary report, giving an at-a-glance audit of the whole conversion.
 
 ---
 
 ## What This Project Demonstrates
 
-For someone reviewing this as part of a portfolio, this project shows:
+For a reviewer assessing this as part of a portfolio, the project shows:
 
-1. Understanding of DICOM internal structure and the DICOM hierarchy (Patient, Study, Series, Image)
-2. Knowledge of the practical differences between clinical (DICOM) and research (NIfTI) formats
-3. Familiarity with `pydicom` and `SimpleITK`, the two foundational libraries for medical imaging in Python
-4. Awareness of real-world data issues such as breathing motion, sorting by physical position, and metadata inconsistencies
-5. Ability to debug iteratively: the first version of this pipeline produced incorrect 3D output by collapsing temporal positions into the Z axis, which was identified and corrected
-6. Clean code structure with hardcoded defaults, optional CLI overrides, error handling, and informative logging
+1. Understanding of the DICOM hierarchy and the practical differences between clinical and research image formats.
+2. Knowledge of real acquisition structure: temporal positions, b-values, echoes, and why naive slice stacking corrupts multi-volume series.
+3. The judgment to identify a flawed approach, diagnose it through visual inspection, and replace it with an established tool rather than persisting with a custom reimplementation.
+4. Practical engineering habits: separating responsibilities cleanly, validating results rather than trusting return codes, and building QC into the pipeline.
+5. Familiarity with the standard medical imaging toolchain: `dcm2niix`, `SimpleITK`, `pydicom`, and viewers such as ITK-SNAP and LIFEx.
 
 ---
 
 ## Possible Extensions
 
-This pipeline is a foundation. Logical next steps include:
-
-- Adding intensity normalization (z-score, min-max, or percentile-based)
-- Adding resampling to isotropic voxel spacing using `SimpleITK.Resample`
-- Adding bias field correction with N4 for MRI volumes
-- Integrating with PyRadiomics to extract quantitative imaging features from each volume
-- Adding a CLI flag to extract only specific sequence types (for example, only DCE)
-- Building a 3D visualization viewer using matplotlib or napari
+- Intensity normalization (z-score, percentile-based) for cross-subject comparability
+- Resampling to isotropic voxel spacing with `SimpleITK.Resample`
+- N4 bias field correction for MRI intensity uniformity
+- Parsing the `dcm2niix` JSON sidecars into a dataset-wide metadata table
+- A CLI flag to convert only selected sequence types, for example DCE only
+- Integration with PyRadiomics to extract quantitative features from each volume
 
 ---
+
 
 ## Author
 
